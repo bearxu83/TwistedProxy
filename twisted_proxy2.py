@@ -17,6 +17,7 @@ from cryptography.fernet import Fernet
 CLOUD_HOST = '127.0.0.1'
 CLOUD_PORT = 8083
 DKEY = Fernet.generate_key()
+VERIFY_SIZE = 12
 
 class ProxyClient2(ProxyClient):
     def __init__(self, *args):
@@ -120,55 +121,75 @@ def split_path(hostport):
     return host, int(port)
 	
 class TransferContract(protocol.Protocol):
-    INITIAL_STATE = 0
-    LENGTH_STATE = 1
-    HEADER_STATE = 2
-    MAIN_STATE = 3
-    DECRYPT_STATE = 4
-    INITIAL_SIZE = 0
-    header_size = 0
+    SIZE_STATE = 0
+    BODY_STATE = 1
+    DISCARD_STATE = 2
+    #~ MAIN_STATE = 3
+    #~ DECRYPT_STATE = 4
+    
     def connectionMade(self):
+	self.body_size = 0
+	self.verify_tag = ''
+	self.has_header = False
 	self._trans_buff = ''
-	self._trans_state = self.INITIAL_STATE
+	self._trans_state = self.SIZE_STATE
 	self.crypt_tool = Fernet(DKEY)
+	
     def dataReceived(self, data):
 	self._trans_buff += data
 	
-	if self._trans_state == self.INITIAL_STATE:
-	    d = self.read_bytes(self.INITIAL_SIZE)
+	if self._trans_state == self.SIZE_STATE:
+	    d = self.read_bytes(VERIFY_SIZE + 4)
 	    d.addErrback(self.after_error)
-	    d.addCallback(self.after_initial_data)
-	elif self._trans_state == self.LENGTH_STATE:
-	    d = self.read_bytes(4)
-	    d.addCallback(self.after_length_data)
+	    d.addCallback(self.got_size_data)
+	elif self._trans_state == self.BODY_STATE:
+	    d = self.read_bytes(self.body_size)
+	    d.addCallback(self.got_unchecked_body_data)
 	    d.addErrback(self.after_error)
-	elif self._trans_state == self.HEADER_STATE:
-	    d = self.read_bytes(self.header_size)
-	    d.addCallback(self.after_header_data)
-	    d.addErrback(self.after_error)
-	elif self._trans_state == self.DECRYPT_STATE:
-	    d = self.read_bytes(self.decrypted_size)
-	    d.addCallback(self.after_decrypted_data)
-	elif self._trans_state == self.MAIN_STATE:
-	    self.transfer(self._trans_buff)
-	    self._trans_buff = ''
+	elif self._trans_state == self.DISCARD_STATE:
+	    d = self.read_bytes(self.body_size)
     
     def after_error(self, reason):
 	log.msg('>>>>>>>>>>>>>>>>>>>>>>>>>Current State:' + str(self._trans_state))
 	log.msg(reason)
 	
-    def after_initial_data(self, result):
-	log.msg('horrible bug')
-	self.set_status(self.LENGTH_STATE)
+    def got_size_data(self, data):
+	self.verify_tag, encrypted_bytes = data[:VERIFY_SIZE], data[VERIFY_SIZE:]
+	size_bytes = self.decrypt(encrypted_bytes)
+	self.body_size = struct.unpack('i', size_bytes)[0]
+	self.after_unpacked_body_size()
 	
 	
-    def after_length_data(self, result):
-	self.header_size = struct.unpack('I', result)[0]
-	log.msg('just after length', self.header_size)
+    def after_unpacked_body_size(self):
+	#self.set_status(self.BODY_STATE) or DISCARD_STATE
+	raise NotImplementedError()
+	
+    def got_unchecked_body_data(self, data):
+	comfortable_data = self.decrypt(data)
+	if self.verify_body_data(comfortable_data):
+	    if has_header:
+		self.parse_body_data(comfortable_data)
+	    else:
+		self.parse_header_data(comfortable_data)
+	    self.set_status(self.SIZE_STATE)
+	else:
+	    self.verify_failed(comfortable_data)
+    
+    def parse_header(self, data):
+	#to change has_header
+	raise NotImplementedError()
+	
+    def parse_body(self, data):
+	raise NotImplementedError()
+	
+    def verify_body_data(self, data):
+	pass
+	
+    def verify_failed(self, data):
+	pass
 
-	self.set_status(self.HEADER_STATE)
 	
-    def after_header_data(self, result):
+    def after_header_data_old(self, result):
 	self.header = json.loads(result)
 	if self.header_size > 100:
 	    log.msg('just after size', self.header)
@@ -179,11 +200,6 @@ class TransferContract(protocol.Protocol):
 	else:
 	    self.decrypted_size = self.header['encrypted_size']
 	    self.set_status(self.DECRYPT_STATE)
-	
-    def after_decrypted_data(self, result):
-	decrypted_data = self.decrypt(result)
-	self.transfer(decrypted_data)
-	self.set_status(self.MAIN_STATE)
 	
     def read_bytes(self, length):
 	d = defer.Deferred()
