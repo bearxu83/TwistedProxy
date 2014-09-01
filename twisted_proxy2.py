@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+#~ from twisted.internet import iocpreactor
+#~ iocpreactor.install()
 from twisted.internet import reactor, protocol, defer
 from twisted.web.proxy import Proxy, ProxyClient, ProxyClientFactory
 from twisted.web.http import HTTPFactory, HTTPChannel, Request, HTTPClient
@@ -8,6 +10,7 @@ import urlparse
 import sys
 import json
 import struct
+import warnings
 from cryptography.fernet import Fernet
 #ClientFactory is complex, has many init variable
 #Client in pool should talk to Transport in pool
@@ -15,11 +18,17 @@ from cryptography.fernet import Fernet
 # cryptography GCB tag, iv, key, authtext, 16,4, 
 
 #send wrong, using dict
+#send back is wrong in that the callback cum is wrong
+#bug comes from state code part and deal with minus number
+#http's transferqueue = > finish()
+#http local close remote still open for the stream
+#http t.co can't redirect
+#both close and connection Lost wrong
 
 CLOUD_HOST = '127.0.0.1'
 CLOUD_PORT = 8083
 DKEY = Fernet.generate_key()
-VERIFY_SIZE = 12
+VERIFY_SIZE = 0
 
 class ProxyClient2(ProxyClient):
     def __init__(self, *args):
@@ -80,7 +89,7 @@ class Fetcher(protocol.Protocol):
 	self.factory = factory
 	
     def send_data(self, value):
-	log.msg('Fetcher sent data')
+	#~ log.msg('Fetcher sent data')
 	self.transport.write(value)
 	#~ print 'value sent'
 	
@@ -96,7 +105,8 @@ class Fetcher(protocol.Protocol):
 	
     
     def dataReceived(self, value):
-	self.father.send(value)
+	#~ log.msg('<-Outest', len(value))
+	self.father.write(value)
 	#~ print 'send back'
 	
 class FetcherFactory(protocol.ClientFactory):
@@ -113,10 +123,11 @@ class FetcherFactory(protocol.ClientFactory):
 	
     def transfer(self, data):
 	self.child.transport.write(data)
-	#~ log.msg('++Data:', repr(data))
+	#~ log.msg('++Data:', len(data))
 	
     def clientConnectionFailed(self, connector, reason):
-	self.server.transport.loseConnection()
+	#~ self.server.transport.loseConnection()
+	self.server.handle_close(source='here')
 	
 	
 def split_path(hostport):
@@ -134,7 +145,7 @@ class TransferContract(protocol.Protocol):
 	self.body_size = 0
 	self.verify_tag = ''
 	self.here_closed = False
-	self.remove_closed = False
+	self.remote_closed = False
 	self.has_header = False
 	self._trans_buff = ''
 	self._trans_state = self.SIZE_STATE
@@ -153,6 +164,9 @@ class TransferContract(protocol.Protocol):
 	    d.addErrback(self.after_error)
 	elif self._trans_state == self.DISCARD_STATE:
 	    d = self.read_bytes(self.body_size)
+	    d.addCallback(lambda ignore: self.set_status(self.SIZE_STATE))
+	    d.addErrback(self.after_error)
+	    
     
     def after_error(self, reason):
 	log.msg('>>>>>>>>>>>>>>>>>>>>>>>>>Current State:' + str(self._trans_state))
@@ -162,10 +176,14 @@ class TransferContract(protocol.Protocol):
 	self.verify_tag, encrypted_bytes = data[:VERIFY_SIZE], data[VERIFY_SIZE:]
 	size_bytes = self.decrypt(encrypted_bytes)
 	self.body_size = struct.unpack('i', size_bytes)[0]
+	#~ log.msg('<->body', self.body_size)
+	#~ log.msg('here closed', self.here_closed)
 	
-	if self.body_size > 0 or not self.here_closed:
+	#bug below, after reboot, cloud get header ,get body and no action continue
+	if self.body_size > 0 and not self.here_closed:
 	    self.set_status(self.BODY_STATE)
 	elif self.body_size < 0:
+	    self.body_size = 0 - self.body_size
 	    self.handle_close(source='remote')
 	    self.set_status(self.DISCARD_STATE)
 	else:
@@ -204,6 +222,7 @@ class TransferContract(protocol.Protocol):
 	    self.set_status(self.DECRYPT_STATE)
 	
     def read_bytes(self, length):
+	assert length > 0
 	d = defer.Deferred()
 	if len(self._trans_buff) >= length:
 	    result_data, self._trans_buff = self._trans_buff[:length], self._trans_buff[length:]
@@ -218,16 +237,16 @@ class TransferContract(protocol.Protocol):
     def send_encrypted_old(self, header, need_encrypted_data, contents):
 	encrypted_data = self.encrypt(need_encrypted_data)
 	header['encrypted_size'] = len(encrypted_data)
-	log.msg('sent header size:', len(encrypted_data))
+	#~ log.msg('sent header size:', len(encrypted_data))
 	trans_header = json.dumps(header)
 	self.transport.write(struct.pack('I', len(trans_header)))
 	self.transport.write(trans_header)
 	self.transport.write(encrypted_data)
 	self.transport.write(contents)
 	
-    def send(self, data):
-	self.send_encrypted(data)
-	log.msg('cloud send back data')
+    #~ def send(self, data):
+	#~ self.send_encrypted(data)
+	#~ log.msg('cloud send back data')
 	
     def decrypt(self, data):
 	#~ return self.crypt_tool.decrypt(data)
@@ -249,10 +268,11 @@ class TransferContract(protocol.Protocol):
 	    #~ self.factory.pool.put(self.factory)
 	    self.handle_both_close()
 	elif not self.here_closed:
-	    self.send_close_bytes('\x00\x00\x00')
+	    self.send_close_bytes('cancel')
 	    self.handle_remote_close()
 	elif not self.remote_closed:
-	    self.send_close_bytes('\x00\x00\x00')
+	    self.send_close_bytes('cancel')
+	
 	    
 	
     def send_encrypted(self, bytes_data):
@@ -280,7 +300,7 @@ class TransferPool(object):
     def get(self, *args, **kargs):
 	if self._pool:
 	    old_one = self._pool.pop(0)
-	    log.msg('old_one_disconnected:' , old_one.father._disconnected)
+	    #~ log.msg('old_one_disconnected:' , old_one.father._disconnected)
 	    log.msg('Pool Wins: ', len(self._pool))
 	    return old_one.update(*args, **kargs)
 	else:
@@ -309,19 +329,21 @@ class LocalTransfer(TransferContract):
 	self.send_encrypted(self.contents)
 	self.factory.after_conn.callback(self)
 	
-    def transfer(self, data):
-	self.factory.father.write(data)
 	
     def parse_data(self, data):
-	log.msg('loc recved data:', len(data))
+	#~ log.msg('<-loc recved clear data:', len(data))
 	self.factory.father.write(data)
 	
 	
     def handle_remote_close(self):
-	self.factory.father.transport.loseConnection()
+	log.msg('Local: handle remote close, close local')
+	self.factory.father.finish()
 
     def handle_both_close(self):
-	self.factory.pool.put(self.factory)
+	log.msg('Local half rewinded:', self.py_header)
+	if self.factory.father.channel2:
+	    self.factory.father.channel2.factory.pool.put(self.factory)
+	    #~ self.factory.father.channel2 = None
     
     def connectionLost(self, reason):
 	log.msg('->Local End:', self.py_header.get('host', None))
@@ -329,7 +351,12 @@ class LocalTransfer(TransferContract):
 	    if self.py_header.get('host').startswith('post.'):
 		log.msg(self.factory.father.channel.requests)
 	self.factory.after_lost.callback(self)
-	self.factory.father.finish()
+	#~ self.factory.father.channel2.transport.loseConnection()
+	#~ if not self.factory.father.finished:
+	    #~ self.factory.father.finish()
+	#~ self.factory = None
+	#~ self.factory.father = None
+	#~ self.factory.father.finish()
 	
 class LocalTransferFactory(FetcherFactory):
     
@@ -356,15 +383,15 @@ class LocalTransferFactory(FetcherFactory):
 	self.child.body_size = 0
 	self.child.verify_tag = ''
 	self.child.here_closed = False
-	self.child.remove_closed = False
-	self.child.has_header = False
+	self.child.remote_closed = False
 	self.child.send_encrypted(json.dumps(self.py_header))
 	self.child.send_encrypted(self.html_header)
 	self.child.send_encrypted(contents)
 	return self
 	
     def close(self):
-	pass
+	self.child.transport.loseConnection()
+	self.father = None
 	
     def buildProtocol(self, addr):
 	self.child = LocalTransfer(self, self.py_header, self.html_header, self.contents)
@@ -403,6 +430,7 @@ class ProxyRequest2(Request):
 	html_header = ''.join(headers)
 
 	self.content.seek(0, 0)
+	
 	if is_ssl:
 	    host, port = self.uri.split(':')
 	    self.transport.write("HTTP/1.1 200 OK\r\n\r\n")
@@ -410,11 +438,16 @@ class ProxyRequest2(Request):
 	    py_header = dict(host=host, port=int(port), is_ssl=is_ssl)
 	    self.local_factory = self.channel.factory.pool.get(self, py_header, '', '')
 	else:
-	    self.local_factory = LocalTransferFactory(self, py_header, html_header, self.content.read())
-	    reactor.connectTCP(CLOUD_HOST, CLOUD_PORT, self.local_factory)
+	    self.local_factory = self.channel.factory.pool.get(self, py_header,  html_header, self.content.read())
+	    #~ self.local_factory = LocalTransferFactory(self, py_header, html_header, self.content.read())
+	    #~ reactor.connectTCP(CLOUD_HOST, CLOUD_PORT, self.local_factory)
+	self.channel2 = self.channel
+	test_d = self.notifyFinish()
+	test_d.addCallback(lambda ig: self.channel2.transport.loseConnection() if len(self.channel2.requests) == 0 else None)
+	test_d.addBoth(lambda ig: self.local_factory.child.handle_close(source='here'))
     
     def write(self, data):
-	log.msg('father wrote back')
+	#~ log.msg('<-father wrote back', repr(data))
 	self.transport.write(data)
 	
     def finish(self):
@@ -433,10 +466,16 @@ class ProxyRequest2(Request):
 	# log request
 	if hasattr(self.channel, "factory"):
 	    self.channel.factory.log(self)
-
+	    
+	#~ if hasattr(self.channel, 'is_ssl_mode') and self.channel.is_ssl_mode:
+	    #~ self.channel.transport.loseConnection()
+	    #~ return
+	
 	self.finished = 1
 	if not self.queued:
 	    self._cleanup()
+	
+
 
 	
 class LocalServer(HTTPChannel):
@@ -445,22 +484,23 @@ class LocalServer(HTTPChannel):
     
     def dataReceived(self, data):
 	if self.is_ssl_mode and self.requests:
-	    #~ print 'ssl data'
-	    self.requests[-1].local_factory.after_conn.addCallback(lambda child:child.send_encrypted(data))
+	    #~ log.msg('local server sent', len(data))
+	    self.requests[-1].local_factory.after_conn.addCallback(lambda child: self.requests[-1].local_factory.child.send_encrypted(data))
+	    self.requests[-1].local_factory.after_conn.addErrback(lambda reason: log.msg(reason))
 	    return
 	else:
 	    HTTPChannel.dataReceived(self, data)
     
-    def connectionLost(self, reason):
-	if self.is_ssl_mode and self.requests:
-	    log.msg('local msg lost', self.requests[-1].local_factory.py_header)
-	    try:
-		self.requests[-1].local_factory.after_conn.addCallback(lambda local: local.handle_close(source='here'))
-		#~ reactor.callLater(0, self.factory.pool.put, self.requests[-1].local_factory)
-	    except AttributeError:
-		pass
-	else:
-	    HTTPChannel.connectionLost(self, reason)
+    #~ def connectionLost(self, reason):
+	#~ if self.is_ssl_mode and self.requests:
+	    #~ log.msg('local lost', self.requests[-1].local_factory.py_header)
+	    #~ try:
+		#~ self.requests[-1].local_factory.after_conn.addCallback(lambda local: self.requests[-1].local_factory.child.handle_close(source='here'))
+		#~ #reactor.callLater(0, self.factory.pool.put, self.requests[-1].local_factory)
+	    #~ except AttributeError:
+		#~ log.msg('local lost WRONG')
+	#~ else:
+	    #~ HTTPChannel.connectionLost(self, reason)
 	    
 class LocalServerFactory(HTTPFactory):
     pool = TransferPool(LocalTransferFactory)
@@ -471,9 +511,10 @@ class CloudTransfer(TransferContract):
     has_header = False
     
     def parse_data(self, data):
-	log.msg('Cloud parse data:', repr(data))
+	#~ log.msg('<-CT clean data:', len(data))
 	if not self.has_header:
 	    self.header = json.loads(data)
+	    #~ log.msg('<-CT monitor:', self.header)
 	    self.host = self.header['host']
 	    port = self.header['port']
 	    is_ssl = self.header['is_ssl']
@@ -484,8 +525,16 @@ class CloudTransfer(TransferContract):
 	    reactor.connectTCP(self.host, port, self.fetcher_factory)
 	    self.has_header = True
 	else:
-	    self.fetcher_factory.after_conn.addCallback(lambda child: child.send_data(data))
+	    #~ log.msg('<-Cloud body data:', len(data))
+	    #~ self.fetcher_factory.after_conn.addCallback(lambda child: (self.fetcher_factory.transfer(data), log.msg('cloud data sent', len(data))))
+	    self.fetcher_factory.after_conn.addCallback(self.handle_after_conn, data)
+	    self.fetcher_factory.after_conn.addErrback(lambda reason: log.msg(reason))
+	    
 	
+    def handle_after_conn(self, ignore, data):
+	self.fetcher_factory.transfer(data)
+	#~ log.msg('->cloud data sent', len(data))
+    
     def close(self):
 	pass
 	
@@ -496,19 +545,24 @@ class CloudTransfer(TransferContract):
 	return self
 	
     def handle_remote_close(self):
-	self.fetcher_factory.after_conn.addCallback(lambda child: child.transport.loseConnection())
+	self.fetcher_factory.after_conn.addCallback(lambda child: self.fetcher_factory.child.transport.loseConnection())
     
     def handle_both_close(self):
-	self.body_size = 0
+	#~ self.body_size = 0
 	self.verify_tag = ''
 	self.here_closed = False
-	self.remove_closed = False
+	self.remote_closed = False
 	self.has_header = False
-	self._trans_buff = ''
-	self._trans_state = self.SIZE_STATE
+	#~ self._trans_buff = ''
+	#~ self._trans_state = self.SIZE_STATE
+	log.msg('Cloud Rewinded: ', self.header)
     
     def connectionLost(self, reason):
 	self.closed = 1
+	
+    def write(self, data):
+	self.send_encrypted(data)
+	
 class CloudTransferFactory(protocol.ServerFactory):
     pool = TransferPool(CloudTransfer)
     protocol = CloudTransfer
@@ -524,7 +578,6 @@ class SslFetcher(Fetcher):
 	Fetcher.connectionMade(self)
 	
     def connectionLost(self, reason):
-	#~ self.father.factory.pool.put(self.father)
 	self.father.handle_close(source='here')
 
 class SslFetcherFactory(FetcherFactory):
@@ -546,19 +599,20 @@ class HttpFetcher(HTTPClient):
 	self.code = code
 	
     def extractHeader(self, header):
+	#~ log.msg('header', repr(header))
 	self.headers.append(header)
 	HTTPClient.extractHeader(self, header)
 	
     def handleHeader(self, key, val):
-	self.header_dict[key] = val
+	self.header_dict[key.lower()] = val
 	
     def handleEndHeaders(self):
 	if ((self.version == b"HTTP/1.1") and
-	    (self.header_dict.get(b'Content-Length', None) is None) and
-	    (self.header_dict.get(b'Transfer-Encoding', None) is None) and
+	    (self.header_dict.get(b'content-length', None) is None) and
+	    (self.header_dict.get(b'transfer-encoding', None) is None) and
 	    #~ self.method != b"HEAD" and self.code not in NO_BODY_CODES):
 	    self.code not in ('204', '304')):
-	    self.headers.append(b'Transfer-Encoding: chunked\r\n')
+	    self.headers.append(b'transfer-encoding: chunked')
 	    self.malformed_content = True
 
 	self.headers.append('\r\n')
@@ -570,13 +624,15 @@ class HttpFetcher(HTTPClient):
 	if not self._finished:
 	    self._finished = True
 	    if self.malformed_content:
-		self.server.send('0\r\n\r\n')
-	    log.msg('Handle End:', self.server.host)
+		self.server.send_encrypted('\r\n0\r\n\r\n')
+	    #~ log.msg('Handle End:', self.server.host)
+	    log.msg('malformed?', self.malformed_content)
 	    self.transport.loseConnection()
-	    self.server.transport.loseConnection()
-
+	    #~ self.server.transport.loseConnection()
+	    self.server.handle_close(source='here')
+	    
     def handleResponsePart(self, data):
-	self.server.send(data)
+	self.server.send_encrypted(data)
 	
     def connectionMade(self):
 	self.headers = []
@@ -584,6 +640,7 @@ class HttpFetcher(HTTPClient):
 	HTTPClient.connectionMade(self)
     
     def send_data(self, data):
+	#~ log.msg('http sent:', repr(data))
 	self.transport.write(data)
 	
     
