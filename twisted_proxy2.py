@@ -147,7 +147,7 @@ class TransferContract(protocol.Protocol):
 	self.here_closed = False
 	self.remote_closed = False
 	self.has_header = False
-	self._trans_buff = ''
+	self._trans_buff = bytearray()
 	self._trans_state = self.SIZE_STATE
 	self.crypt_tool = Fernet(DKEY)
 	
@@ -225,7 +225,8 @@ class TransferContract(protocol.Protocol):
 	assert length > 0
 	d = defer.Deferred()
 	if len(self._trans_buff) >= length:
-	    result_data, self._trans_buff = self._trans_buff[:length], self._trans_buff[length:]
+	    result_data = str(self._trans_buff[:length])
+	    del self._trans_buff[:length]
 	    d.callback(result_data)
 	return d
 	
@@ -539,7 +540,7 @@ class CloudTransfer(TransferContract):
 	pass
 	
     def update(self):
-	self._trans_buff = ''
+	self._trans_buff = bytearray()
 	self._trans_state = self.SIZE_STATE
 	log.msg('Cloud Rewinded: ', self.header, self)
 	return self
@@ -652,5 +653,5 @@ class HttpFetcherFactory(FetcherFactory):
 log.startLogging(sys.stdout)
 #~ log.startLogging(open('d:/foo.log', 'w'))
 reactor.listenTCP(8083, CloudTransferFactory())
-reactor.listenTCP(8090, LocalServerFactory())
+reactor.listenTCP(8090, LocalServerFactory(timeout=1800))
 reactor.run()
